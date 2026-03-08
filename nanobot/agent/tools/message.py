@@ -1,5 +1,6 @@
 """Message tool for sending messages to users."""
 
+import re
 from typing import Any, Awaitable, Callable
 
 from nanobot.agent.tools.base import Tool
@@ -21,6 +22,7 @@ class MessageTool(Tool):
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
         self._sent_in_turn: bool = False
+        self._sent_keys_in_turn: set[str] = set()
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Set the current message context."""
@@ -35,6 +37,12 @@ class MessageTool(Tool):
     def start_turn(self) -> None:
         """Reset per-turn send tracking."""
         self._sent_in_turn = False
+        self._sent_keys_in_turn.clear()
+
+    @staticmethod
+    def _normalize_content_for_dedupe(content: str) -> str:
+        """Normalize text for duplicate detection without changing meaning."""
+        return re.sub(r"\s+", " ", content).strip()
 
     @property
     def name(self) -> str:
@@ -89,6 +97,15 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
+        # Keep multi-send capability, but suppress exact duplicate pushes in one turn.
+        dedupe_key = "::".join([
+            channel,
+            chat_id,
+            self._normalize_content_for_dedupe(content),
+        ])
+        if dedupe_key in self._sent_keys_in_turn:
+            return f"Skipped duplicate message to {channel}:{chat_id}"
+
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
@@ -101,6 +118,7 @@ class MessageTool(Tool):
 
         try:
             await self._send_callback(msg)
+            self._sent_keys_in_turn.add(dedupe_key)
             if channel == self._default_channel and chat_id == self._default_chat_id:
                 self._sent_in_turn = True
             media_info = f" with {len(media)} attachments" if media else ""
