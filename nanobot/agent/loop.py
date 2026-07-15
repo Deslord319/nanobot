@@ -8,7 +8,7 @@ import re
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
@@ -64,6 +64,8 @@ class AgentLoop:
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
+        a2a_peers: dict | None = None,
+        a2a_local_url: str | None = None,
         channels_config: ChannelsConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
@@ -105,12 +107,15 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
+        self._a2a_peers = a2a_peers or {}
+        self._a2a_local_url = a2a_local_url
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
+        self._register_a2a_tools()
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -129,6 +134,20 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+
+    def _register_a2a_tools(self) -> None:
+        """Register one outbound tool for each configured A2A peer."""
+        if not self._a2a_peers:
+            return
+        from nanobot.agent.tools.a2a import register_a2a_peer_tools
+
+        names = register_a2a_peer_tools(
+            self._a2a_peers,
+            self.tools,
+            local_url=self._a2a_local_url,
+        )
+        if names:
+            logger.info("A2A peers: registered tools {}", ", ".join(names))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -177,6 +196,35 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    def _a2a_relay_text(self, tool_name: str, result: str) -> str | None:
+        """Extract a completed A2A answer when the peer is configured for direct relay."""
+        tool = self.tools.get(tool_name)
+        if not tool or not getattr(tool, "relay_response", False):
+            return None
+        try:
+            payload = json.loads(result)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if payload.get("state") not in {"MESSAGE", "TASK_STATE_COMPLETED"}:
+            return None
+        text = payload.get("text")
+        return text.strip() if isinstance(text, str) and text.strip() else None
+
+    @staticmethod
+    def _latest_user_text(messages: list[dict]) -> str | None:
+        """Return the latest plain-text user request without runtime metadata."""
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                return None
+            if content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                parts = content.split("\n\n", 1)
+                content = parts[1] if len(parts) > 1 else ""
+            return content.strip() or None
+        return None
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -187,6 +235,7 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        current_user_text = self._latest_user_text(initial_messages)
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -207,14 +256,27 @@ class AgentLoop:
                         await on_progress(thought)
                     await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
 
+                effective_arguments = {}
+                for tool_call in response.tool_calls:
+                    arguments = dict(tool_call.arguments or {})
+                    tool = self.tools.get(tool_call.name)
+                    if (
+                        current_user_text
+                        and tool
+                        and getattr(tool, "forward_user_message", False)
+                    ):
+                        arguments["message"] = current_user_text
+                    effective_arguments[tool_call.id] = arguments
                 tool_call_dicts = [
                     {
                         "id": tc.id,
                         "type": "function",
                         "function": {
                             "name": tc.name,
-                            "arguments": json.dumps(tc.arguments, ensure_ascii=False)
-                        }
+                            "arguments": json.dumps(
+                                effective_arguments[tc.id], ensure_ascii=False
+                            ),
+                        },
                     }
                     for tc in response.tool_calls
                 ]
@@ -224,14 +286,22 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
+                relay_content = None
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                    arguments = effective_arguments[tool_call.id]
+                    args_str = json.dumps(arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result = await self.tools.execute(tool_call.name, arguments)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    if len(response.tool_calls) == 1:
+                        relay_content = self._a2a_relay_text(tool_call.name, result)
+                if relay_content is not None:
+                    messages = self.context.add_assistant_message(messages, relay_content)
+                    final_content = relay_content
+                    break
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can

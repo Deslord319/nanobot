@@ -894,6 +894,69 @@ Use `toolTimeout` to override the default 30s per-call timeout for slow servers:
 MCP tools are automatically discovered and registered on startup. The LLM can use them alongside built-in tools — no extra configuration needed.
 
 
+### A2A (Agent-to-Agent)
+
+Install the optional official A2A SDK integration:
+
+```bash
+pip install -e '.[a2a]'
+```
+
+Enable the A2A JSON-RPC endpoint in `~/.nanobot/config.json`:
+
+```json
+{
+  "a2a": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 18791,
+    "publicUrl": "http://127.0.0.1:18791",
+    "name": "my-nanobot",
+    "description": "Private nanobot A2A assistant",
+    "version": "0.1.0",
+    "skills": [
+      {
+        "id": "general_assistant",
+        "name": "General Assistant",
+        "description": "Answer questions and complete tasks with nanobot tools.",
+        "tags": ["assistant", "tools"],
+        "examples": ["Summarize this request"]
+      }
+    ],
+    "peers": {
+      "research": {
+        "enabled": true,
+        "url": "http://127.0.0.1:19001",
+        "description": "Remote research specialist",
+        "headers": {
+          "Authorization": "Bearer YOUR_TOKEN"
+        },
+        "timeoutS": 120,
+        "maxResponseChars": 12000,
+        "allowCrossOriginCard": false,
+        "forwardUserMessage": false,
+        "relayResponse": false
+      }
+    }
+  }
+}
+```
+
+Start the normal gateway. It now serves both configured chat channels and A2A:
+
+```bash
+nanobot gateway
+curl http://127.0.0.1:18791/healthz
+curl http://127.0.0.1:18791/.well-known/agent-card.json
+```
+
+The current adapter supports A2A 1.0 JSON-RPC with `text/plain` input/output. It returns a completed task and a text artifact; streaming and task cancellation are not advertised. Keep the default loopback bind unless authentication is added at a reverse proxy.
+
+Each enabled peer is exposed to the model as an outbound tool named `a2a_<peer>_send`. The tool resolves the peer's Agent Card, sends `message/send`, returns task state, context ID, and text artifacts, and accepts an optional `context_id` for follow-up turns. Peer URLs are fixed by configuration; cross-origin endpoints advertised by an Agent Card are rejected unless explicitly allowed.
+
+Set `forwardUserMessage` for specialist peers that should receive the current user request verbatim after nanobot chooses the tool. Set `relayResponse` when the peer already returns a user-facing answer and nanobot should deliver it directly without a second LLM rewrite. Both options default to `false` so peers that return intermediate data keep the normal orchestration behavior.
+
+
 
 
 ### Security

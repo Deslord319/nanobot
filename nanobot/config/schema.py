@@ -285,6 +285,45 @@ class GatewayConfig(Base):
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
 
+class A2ASkillConfig(Base):
+    """A capability advertised in the public A2A Agent Card."""
+
+    id: str = "general_assistant"
+    name: str = "General Assistant"
+    description: str = "Answer questions and complete tasks with the configured nanobot tools."
+    tags: list[str] = Field(default_factory=lambda: ["assistant", "tools"])
+    examples: list[str] = Field(default_factory=lambda: ["Summarize this request"])
+
+
+class A2APeerConfig(Base):
+    """A remote A2A agent that nanobot may call as a tool."""
+
+    enabled: bool = True
+    url: str = ""
+    description: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
+    agent_card_path: str = "/.well-known/agent-card.json"
+    timeout_s: int = 120
+    max_response_chars: int = 12000
+    allow_cross_origin_card: bool = False
+    forward_user_message: bool = False
+    relay_response: bool = False
+
+
+class A2AConfig(Base):
+    """A2A server configuration."""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 18791
+    public_url: str = "http://127.0.0.1:18791"
+    name: str = "nanobot"
+    description: str = "A nanobot assistant exposed through the A2A protocol."
+    version: str = "0.1.0"
+    skills: list[A2ASkillConfig] = Field(default_factory=lambda: [A2ASkillConfig()])
+    peers: dict[str, A2APeerConfig] = Field(default_factory=dict)
+
+
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
@@ -336,6 +375,7 @@ class Config(BaseSettings):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    a2a: A2AConfig = Field(default_factory=A2AConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
     @property

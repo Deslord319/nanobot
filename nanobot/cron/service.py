@@ -74,18 +74,42 @@ class CronService:
         self._last_mtime: float = 0.0
         self._timer_task: asyncio.Task | None = None
         self._running = False
+        self._storage_disabled_reason: str | None = None
+
+    def _disable_storage(self, action: str, error: Exception) -> None:
+        """Disable on-disk persistence after a filesystem failure."""
+        detail = f"{type(error).__name__}: {error}"
+        if self._storage_disabled_reason == detail:
+            return
+        self._storage_disabled_reason = detail
+        logger.warning(
+            "Cron storage disabled after failing to {} {}: {}",
+            action,
+            self.store_path,
+            error,
+        )
 
     def _load_store(self) -> CronStore:
         """Load jobs from disk. Reloads automatically if file was modified externally."""
-        if self._store and self.store_path.exists():
-            mtime = self.store_path.stat().st_mtime
-            if mtime != self._last_mtime:
-                logger.info("Cron: jobs.json modified externally, reloading")
-                self._store = None
+        if self._store:
+            try:
+                if self.store_path.exists():
+                    mtime = self.store_path.stat().st_mtime
+                    if mtime != self._last_mtime:
+                        logger.info("Cron: jobs.json modified externally, reloading")
+                        self._store = None
+            except OSError as e:
+                self._disable_storage("stat", e)
         if self._store:
             return self._store
 
-        if self.store_path.exists():
+        try:
+            exists = self.store_path.exists()
+        except OSError as e:
+            self._disable_storage("check", e)
+            exists = False
+
+        if exists:
             try:
                 data = json.loads(self.store_path.read_text(encoding="utf-8"))
                 jobs = []
@@ -121,6 +145,8 @@ class CronService:
                 self._store = CronStore(jobs=jobs)
             except Exception as e:
                 logger.warning("Failed to load cron store: {}", e)
+                if isinstance(e, OSError):
+                    self._disable_storage("read", e)
                 self._store = CronStore()
         else:
             self._store = CronStore()
@@ -132,45 +158,49 @@ class CronService:
         if not self._store:
             return
 
-        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.store_path.parent.mkdir(parents=True, exist_ok=True)
 
-        data = {
-            "version": self._store.version,
-            "jobs": [
-                {
-                    "id": j.id,
-                    "name": j.name,
-                    "enabled": j.enabled,
-                    "schedule": {
-                        "kind": j.schedule.kind,
-                        "atMs": j.schedule.at_ms,
-                        "everyMs": j.schedule.every_ms,
-                        "expr": j.schedule.expr,
-                        "tz": j.schedule.tz,
-                    },
-                    "payload": {
-                        "kind": j.payload.kind,
-                        "message": j.payload.message,
-                        "deliver": j.payload.deliver,
-                        "channel": j.payload.channel,
-                        "to": j.payload.to,
-                    },
-                    "state": {
-                        "nextRunAtMs": j.state.next_run_at_ms,
-                        "lastRunAtMs": j.state.last_run_at_ms,
-                        "lastStatus": j.state.last_status,
-                        "lastError": j.state.last_error,
-                    },
-                    "createdAtMs": j.created_at_ms,
-                    "updatedAtMs": j.updated_at_ms,
-                    "deleteAfterRun": j.delete_after_run,
-                }
-                for j in self._store.jobs
-            ]
-        }
+            data = {
+                "version": self._store.version,
+                "jobs": [
+                    {
+                        "id": j.id,
+                        "name": j.name,
+                        "enabled": j.enabled,
+                        "schedule": {
+                            "kind": j.schedule.kind,
+                            "atMs": j.schedule.at_ms,
+                            "everyMs": j.schedule.every_ms,
+                            "expr": j.schedule.expr,
+                            "tz": j.schedule.tz,
+                        },
+                        "payload": {
+                            "kind": j.payload.kind,
+                            "message": j.payload.message,
+                            "deliver": j.payload.deliver,
+                            "channel": j.payload.channel,
+                            "to": j.payload.to,
+                        },
+                        "state": {
+                            "nextRunAtMs": j.state.next_run_at_ms,
+                            "lastRunAtMs": j.state.last_run_at_ms,
+                            "lastStatus": j.state.last_status,
+                            "lastError": j.state.last_error,
+                        },
+                        "createdAtMs": j.created_at_ms,
+                        "updatedAtMs": j.updated_at_ms,
+                        "deleteAfterRun": j.delete_after_run,
+                    }
+                    for j in self._store.jobs
+                ]
+            }
 
-        self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        self._last_mtime = self.store_path.stat().st_mtime
+            self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._last_mtime = self.store_path.stat().st_mtime
+            self._storage_disabled_reason = None
+        except OSError as e:
+            self._disable_storage("write", e)
     
     async def start(self) -> None:
         """Start the cron service."""

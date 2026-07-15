@@ -3,9 +3,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
-from nanobot.cli.commands import app
+from nanobot.cli.commands import _acquire_gateway_lock, _release_gateway_lock, app
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
@@ -356,3 +357,15 @@ def test_gateway_uses_config_directory_for_cron_store(monkeypatch, tmp_path: Pat
 
     assert isinstance(result.exception, _StopGateway)
     assert seen["cron_store"] == config_file.parent / "cron" / "jobs.json"
+
+
+def test_gateway_lock_blocks_second_instance(tmp_path: Path) -> None:
+    lock_path = tmp_path / "instance" / "gateway.lock"
+
+    first = _acquire_gateway_lock(lock_path)
+    try:
+        with pytest.raises(typer.Exit) as exc:
+            _acquire_gateway_lock(lock_path)
+        assert exc.value.exit_code == 1
+    finally:
+        _release_gateway_lock(first)

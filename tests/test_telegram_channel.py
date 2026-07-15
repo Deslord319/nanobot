@@ -19,9 +19,13 @@ class _FakeHTTPXRequest:
 class _FakeUpdater:
     def __init__(self, on_start_polling) -> None:
         self._on_start_polling = on_start_polling
+        self.stop_calls = 0
 
     async def start_polling(self, **kwargs) -> None:
         self._on_start_polling()
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
 
 
 class _FakeBot:
@@ -44,6 +48,8 @@ class _FakeApp:
         self.updater = _FakeUpdater(on_start_polling)
         self.handlers = []
         self.error_handlers = []
+        self.stop_calls = 0
+        self.shutdown_calls = 0
 
     def add_error_handler(self, handler) -> None:
         self.error_handlers.append(handler)
@@ -56,6 +62,12 @@ class _FakeApp:
 
     async def start(self) -> None:
         pass
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
 
 
 class _FakeBuilder:
@@ -89,6 +101,7 @@ class _FakeBuilder:
 
 @pytest.mark.asyncio
 async def test_start_uses_request_proxy_without_builder_proxy(monkeypatch) -> None:
+    _FakeHTTPXRequest.instances.clear()
     config = TelegramConfig(
         enabled=True,
         token="123:abc",
@@ -108,10 +121,42 @@ async def test_start_uses_request_proxy_without_builder_proxy(monkeypatch) -> No
 
     await channel.start()
 
-    assert len(_FakeHTTPXRequest.instances) == 1
-    assert _FakeHTTPXRequest.instances[0].kwargs["proxy"] == config.proxy
-    assert builder.request_value is _FakeHTTPXRequest.instances[0]
-    assert builder.get_updates_request_value is _FakeHTTPXRequest.instances[0]
+    assert len(_FakeHTTPXRequest.instances) == 2
+    request, update_request = _FakeHTTPXRequest.instances
+    assert request.kwargs["proxy"] == config.proxy
+    assert update_request.kwargs["proxy"] == config.proxy
+    assert builder.request_value is request
+    assert builder.get_updates_request_value is update_request
+    assert channel.is_running is False
+    assert channel._app is None
+
+
+@pytest.mark.asyncio
+async def test_start_cleans_up_state_after_polling_error(monkeypatch) -> None:
+    config = TelegramConfig(
+        enabled=True,
+        token="123:abc",
+        allow_from=["*"],
+    )
+    bus = MessageBus()
+    channel = TelegramChannel(config, bus)
+    app = _FakeApp(lambda: (_ for _ in ()).throw(RuntimeError("polling failed")))
+    builder = _FakeBuilder(app)
+
+    monkeypatch.setattr("nanobot.channels.telegram.HTTPXRequest", _FakeHTTPXRequest)
+    monkeypatch.setattr(
+        "nanobot.channels.telegram.Application",
+        SimpleNamespace(builder=lambda: builder),
+    )
+
+    with pytest.raises(RuntimeError, match="polling failed"):
+        await channel.start()
+
+    assert channel.is_running is False
+    assert channel._app is None
+    assert app.updater.stop_calls == 1
+    assert app.stop_calls == 1
+    assert app.shutdown_calls == 1
 
 
 def test_derive_topic_session_key_uses_thread_id() -> None:

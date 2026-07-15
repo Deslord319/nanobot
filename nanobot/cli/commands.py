@@ -1,10 +1,12 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import hashlib
 import os
 import select
 import signal
 import sys
+import tempfile
 from pathlib import Path
 
 # Force UTF-8 encoding for Windows console
@@ -283,6 +285,71 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
     return loaded
 
 
+def _acquire_gateway_lock(lock_path: Path, owner_dir: Path | None = None):
+    """Prevent multiple gateway instances from sharing the same runtime dir."""
+    owner_label = owner_dir or lock_path.parent
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+", encoding="utf-8")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                console.print(
+                    f"[red]Error: nanobot gateway is already running for {owner_label}[/red]"
+                )
+                raise typer.Exit(1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                console.print(
+                    f"[red]Error: nanobot gateway is already running for {owner_label}[/red]"
+                )
+                raise typer.Exit(1)
+
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+        return fh
+    except Exception:
+        fh.close()
+        raise
+
+
+def _release_gateway_lock(lock_handle) -> None:
+    """Release the gateway singleton lock."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            lock_handle.seek(0)
+            msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    finally:
+        try:
+            lock_handle.close()
+        except Exception:
+            pass
+
+
+def _get_gateway_lock_path(config_dir: Path) -> Path:
+    """Store singleton locks in a temp dir so read-only config dirs still work."""
+    digest = hashlib.sha256(str(config_dir.resolve()).encode("utf-8")).hexdigest()[:16]
+    lock_dir = Path(tempfile.gettempdir()) / "nanobot-locks"
+    return lock_dir / f"{digest}.lock"
+
+
 # ============================================================================
 # Gateway / Server
 # ============================================================================
@@ -304,12 +371,16 @@ def gateway(
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
     from nanobot.session.manager import SessionManager
+    from nanobot.config.loader import get_config_path
 
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
 
-    config = _load_runtime_config(config, workspace)
+    config_arg = config
+    config = _load_runtime_config(config_arg, workspace)
+    config_dir = Path(config_arg).expanduser().resolve().parent if config_arg else get_config_path().parent
+    lock_handle = _acquire_gateway_lock(_get_gateway_lock_path(config_dir), owner_dir=config_dir)
 
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
     sync_workspace_templates(config.workspace_path)
@@ -339,6 +410,8 @@ def gateway(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
+        a2a_peers=config.a2a.peers,
+        a2a_local_url=config.a2a.public_url if config.a2a.enabled else None,
         channels_config=config.channels,
     )
 
@@ -437,6 +510,20 @@ def gateway(
         enabled=hb_cfg.enabled,
     )
 
+    a2a_server = None
+    if config.a2a.enabled:
+        try:
+            from nanobot.a2a.server import create_a2a_server
+        except ImportError:
+            console.print("[red]A2A dependencies are not installed.[/red]")
+            console.print("Install them with: [cyan]pip install -e '.[a2a]'[/cyan]")
+            raise typer.Exit(1)
+        a2a_server = create_a2a_server(agent, config.a2a)
+        console.print(
+            f"[green]✓[/green] A2A: {config.a2a.public_url} "
+            "([dim]/.well-known/agent-card.json[/dim])"
+        )
+
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
@@ -446,24 +533,38 @@ def gateway(
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
-    console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
+    if hb_cfg.enabled:
+        console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
+    else:
+        console.print("[dim]Heartbeat: disabled[/dim]")
 
     async def run():
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
+            services = [
                 agent.run(),
                 channels.start_all(),
-            )
+            ]
+            if a2a_server is not None:
+                services.append(a2a_server.serve())
+            await asyncio.gather(*services)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
+        except Exception as e:
+            from loguru import logger
+
+            logger.exception("Gateway crashed with an unexpected error")
+            console.print(f"[red]Gateway crashed:[/red] {e}")
         finally:
+            if a2a_server is not None:
+                a2a_server.should_exit = True
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
             agent.stop()
             await channels.stop_all()
+            _release_gateway_lock(lock_handle)
 
     asyncio.run(run())
 
@@ -523,6 +624,8 @@ def agent(
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
+        a2a_peers=config.a2a.peers,
+        a2a_local_url=config.a2a.public_url if config.a2a.enabled else None,
         channels_config=config.channels,
     )
 

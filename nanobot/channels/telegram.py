@@ -205,60 +205,79 @@ class TelegramChannel(BaseChannel):
             logger.error("Telegram bot token not configured")
             return
 
+        self._app = None
         self._running = True
-
-        # Build the application with larger connection pool to avoid pool-timeout on long runs
-        req = HTTPXRequest(
-            connection_pool_size=16,
-            pool_timeout=5.0,
-            connect_timeout=30.0,
-            read_timeout=30.0,
-            proxy=self.config.proxy if self.config.proxy else None,
-        )
-        builder = Application.builder().token(self.config.token).request(req).get_updates_request(req)
-        self._app = builder.build()
-        self._app.add_error_handler(self._on_error)
-
-        # Add command handlers
-        self._app.add_handler(CommandHandler("start", self._on_start))
-        self._app.add_handler(CommandHandler("new", self._forward_command))
-        self._app.add_handler(CommandHandler("stop", self._forward_command))
-        self._app.add_handler(CommandHandler("help", self._on_help))
-
-        # Add message handler for text, photos, voice, documents
-        self._app.add_handler(
-            MessageHandler(
-                (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL)
-                & ~filters.COMMAND,
-                self._on_message
-            )
-        )
-
-        logger.info("Starting Telegram bot (polling mode)...")
-
-        # Initialize and start polling
-        await self._app.initialize()
-        await self._app.start()
-
-        # Get bot info and register command menu
-        bot_info = await self._app.bot.get_me()
-        logger.info("Telegram bot @{} connected", bot_info.username)
-
         try:
-            await self._app.bot.set_my_commands(self.BOT_COMMANDS)
-            logger.debug("Telegram bot commands registered")
-        except Exception as e:
-            logger.warning("Failed to register bot commands: {}", e)
+            # Build the application with larger connection pool to avoid pool-timeout on long runs
+            # When no explicit proxy is configured, disable httpx's system-proxy
+            # auto-detection (trust_env=True is httpx's default). This prevents
+            # Clash/V2Ray system proxies from intercepting Telegram's TLS tunnel,
+            # which causes SSL MAC errors and ConnectErrors on node-switching.
+            _no_proxy_kwargs: dict = {} if self.config.proxy else {"trust_env": False}
+            req = HTTPXRequest(
+                connection_pool_size=16,
+                pool_timeout=10.0,
+                connect_timeout=30.0,
+                read_timeout=30.0,
+                proxy=self.config.proxy if self.config.proxy else None,
+                httpx_kwargs=_no_proxy_kwargs,
+            )
+            # Use larger read_timeout for getUpdates because long polling waits up to 50s
+            update_req = HTTPXRequest(
+                connection_pool_size=4,
+                pool_timeout=10.0,
+                connect_timeout=30.0,
+                read_timeout=60.0,
+                proxy=self.config.proxy if self.config.proxy else None,
+                httpx_kwargs=_no_proxy_kwargs,
+            )
+            builder = Application.builder().token(self.config.token).request(req).get_updates_request(update_req)
+            self._app = builder.build()
+            self._app.add_error_handler(self._on_error)
 
-        # Start polling (this runs until stopped)
-        await self._app.updater.start_polling(
-            allowed_updates=["message"],
-            drop_pending_updates=True  # Ignore old messages on startup
-        )
+            # Add command handlers
+            self._app.add_handler(CommandHandler("start", self._on_start))
+            self._app.add_handler(CommandHandler("new", self._forward_command))
+            self._app.add_handler(CommandHandler("stop", self._forward_command))
+            self._app.add_handler(CommandHandler("help", self._on_help))
 
-        # Keep running until stopped
-        while self._running:
-            await asyncio.sleep(1)
+            # Add message handler for text, photos, voice, documents
+            self._app.add_handler(
+                MessageHandler(
+                    (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.Document.ALL)
+                    & ~filters.COMMAND,
+                    self._on_message
+                )
+            )
+
+            logger.info("Starting Telegram bot (polling mode)...")
+
+            # Initialize and start polling
+            await self._app.initialize()
+            await self._app.start()
+
+            # Get bot info and register command menu
+            bot_info = await self._app.bot.get_me()
+            logger.info("Telegram bot @{} connected", bot_info.username)
+
+            try:
+                await self._app.bot.set_my_commands(self.BOT_COMMANDS)
+                logger.debug("Telegram bot commands registered")
+            except Exception as e:
+                logger.warning("Failed to register bot commands: {}", e)
+
+            # Start polling (this runs until stopped)
+            await self._app.updater.start_polling(
+                allowed_updates=["message"],
+                drop_pending_updates=True  # Ignore old messages on startup
+            )
+
+            # Keep running until stopped
+            while self._running:
+                await asyncio.sleep(1)
+        finally:
+            self._running = False
+            await self._shutdown_app()
 
     async def stop(self) -> None:
         """Stop the Telegram bot."""
@@ -273,12 +292,33 @@ class TelegramChannel(BaseChannel):
         self._media_group_tasks.clear()
         self._media_group_buffers.clear()
 
-        if self._app:
-            logger.info("Stopping Telegram bot...")
-            await self._app.updater.stop()
-            await self._app.stop()
-            await self._app.shutdown()
-            self._app = None
+        logger.info("Stopping Telegram bot...")
+        await self._shutdown_app()
+
+    async def _shutdown_app(self) -> None:
+        """Stop the Telegram application if it is running."""
+        app = self._app
+        if app is None:
+            return
+
+        self._app = None
+
+        try:
+            updater = getattr(app, "updater", None)
+            if updater is not None and hasattr(updater, "stop"):
+                await updater.stop()
+        except Exception as e:
+            logger.debug("Error stopping Telegram updater: {}", e)
+
+        try:
+            await app.stop()
+        except Exception as e:
+            logger.debug("Error stopping Telegram app: {}", e)
+
+        try:
+            await app.shutdown()
+        except Exception as e:
+            logger.debug("Error shutting down Telegram app: {}", e)
 
     @staticmethod
     def _get_media_type(path: str) -> str:

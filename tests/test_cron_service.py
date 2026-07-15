@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -57,5 +58,31 @@ async def test_running_service_honors_external_disable(tmp_path) -> None:
 
         await asyncio.sleep(0.35)
         assert called == []
+    finally:
+        service.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_tolerates_unwritable_store(monkeypatch, tmp_path) -> None:
+    store_path = tmp_path / "cron" / "jobs.json"
+    service = CronService(store_path)
+    service.add_job(
+        name="keep-running",
+        schedule=CronSchedule(kind="every", every_ms=1_000),
+        message="hello",
+    )
+
+    original_write_text = Path.write_text
+
+    def fail_write(self: Path, data: str, encoding: str | None = None, errors=None, newline=None):
+        if self == store_path:
+            raise PermissionError("read-only store")
+        return original_write_text(self, data, encoding=encoding, errors=errors, newline=newline)
+
+    monkeypatch.setattr(Path, "write_text", fail_write)
+
+    await service.start()
+    try:
+        assert service.status()["jobs"] == 1
     finally:
         service.stop()
